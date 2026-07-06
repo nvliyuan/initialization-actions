@@ -27,9 +27,9 @@ function version_le() ( set +x ;  [ "$1" = "$(echo -e "$1\n$2" | sort -V | head 
 function version_lt() ( set +x ;  [ "$1" = "$2" ] && return 1 || version_le $1 $2 ; )
 
 readonly -A supported_os=(
-  ['debian']="10 11 12"
+  ['debian']="10 11 12 13"
   ['rocky']="8 9"
-  ['ubuntu']="18.04 20.04 22.04"
+  ['ubuntu']="18.04 20.04 22.04 24.04"
 )
 
 # dynamically define OS version test utility functions
@@ -62,7 +62,7 @@ if [[ "${OS_ID}" == debian ]] || [[ "${OS_ID}" == ubuntu ]]; then
   RSTUDIO_SERVER_VERSION=1.2.5019
   if [[ "${OS_CODE}" == stretch ]]; then
     RSTUDIO_SERVER_URL=https://download2.rstudio.org/server/debian9/x86_64
-  elif [[ "$OS_CODE" == bookworm ]] || [[ "${OS_CODE}" == jammy ]]; then
+  elif [[ "$OS_CODE" == bookworm ]] || [[ "$OS_CODE" == trixie ]] || [[ "${OS_CODE}" == jammy ]] || [[ "${OS_CODE}" == noble ]]; then
   # Choose Ubuntu 22 compatible version, see
   # https://community.rstudio.com/t/dependency-error-when-installing-rstudio-on-ubuntu-22-04-with-libssl/135397.
     RSTUDIO_SERVER_VERSION=2023.09.1-494
@@ -166,13 +166,23 @@ if [[ "${ROLE}" == 'Master' ]]; then
 
   # Install RStudio Server
   REPOSITORY_KEY=95C0FAF38DB3CCAD0C080A7BDC78B2DDEABC47B7
-  run_with_retries apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys ${REPOSITORY_KEY}
+  # apt-key is deprecated and missing on newer Debian/Ubuntu versions.
+  if command -v apt-key &>/dev/null; then
+    run_with_retries apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "${REPOSITORY_KEY}"
+  else
+    update_apt_get && apt-get install -y gnupg dirmngr
+    run_with_retries gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys "${REPOSITORY_KEY}"
+    gpg --export "${REPOSITORY_KEY}" > /etc/apt/trusted.gpg.d/rstudio.gpg
+  fi
   # https://cran.r-project.org/bin/linux/ubuntu/
   if [[ "${OS_ID}" == "ubuntu" ]]; then
     curl -fsSL --retry-connrefused --retry 10 --retry-max-time 30 https://cloud.r-project.org/bin/linux/ubuntu/marutter_pubkey.asc | tee -a /etc/apt/trusted.gpg.d/cran_ubuntu_key.asc
   fi
-  apt-get install -y software-properties-common
-  add-apt-repository "deb http://cran.r-project.org/bin/linux/${OS_ID} ${OS_CODE}-cran40/"
+  cran_suffix="cran40"
+  if [[ "${OS_ID}" == "debian" ]] && [[ "${OS_CODE}" == "trixie" ]]; then
+    cran_suffix="cran46"
+  fi
+  echo "deb http://cran.r-project.org/bin/linux/${OS_ID} ${OS_CODE}-${cran_suffix}/" > /etc/apt/sources.list.d/cran.list
   if [[ ${OS_ID} == ubuntu ]] && [[ $(echo "${DATAPROC_IMAGE_VERSION} < 2.1" | bc -l) == 1 ]]; then
     install_package
   fi
@@ -194,7 +204,7 @@ if [[ "${ROLE}" == 'Master' ]]; then
   fi
   if [[ -z "${USER_PASSWORD}" ]]; then
     service_file=/etc/systemd/system/rstudio-server.service
-    if [[ "${OS_CODE}" == "bookworm" ]] || [[ "${OS_CODE}" == "jammy" ]];then
+    if [[ "${OS_CODE}" == "bookworm" ]] || [[ "${OS_CODE}" == "trixie" ]] || [[ "${OS_CODE}" == "jammy" ]] || [[ "${OS_CODE}" == "noble" ]]; then
       service_file=/lib/systemd/system/rstudio-server.service
     fi
     sed -i 's:ExecStart=\(.*\):Environment=USER=rstudio\nExecStart=\1 --auth-none 1:1' "$service_file"
