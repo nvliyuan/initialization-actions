@@ -93,6 +93,18 @@ function get_metadata_attribute() {
   /usr/share/google/get_metadata_value "attributes/${attribute_name}" || echo -n "${default_value}"
 }
 
+function get_latest_rapids_version() {
+  local -r scala_ver=$1
+  local -r metadata_url="https://repo1.maven.org/maven2/com/nvidia/rapids-4-spark_${scala_ver}/maven-metadata.xml"
+  wget -nv -O- "${metadata_url}" 2>/dev/null | sed -n 's/.*<release>\(.*\)<\/release>.*/\1/p'
+}
+
+function get_latest_xgboost_version() {
+  local -r scala_ver=$1
+  local -r metadata_url="https://repo.maven.apache.org/maven2/ml/dmlc/xgboost4j-gpu_${scala_ver}/maven-metadata.xml"
+  wget -nv -O- "${metadata_url}" 2>/dev/null | sed -n 's/.*<release>\(.*\)<\/release>.*/\1/p'
+}
+
 CA_TMPDIR="$(mktemp -u -d -p /run/tmp -t ca_dir-XXXX)"
 PSN="$(get_metadata_attribute private_secret_name)"
 readonly PSN
@@ -226,9 +238,44 @@ else
 fi
 
 # Update SPARK RAPIDS config
-readonly DEFAULT_SPARK_RAPIDS_VERSION="26.06.0"
-readonly SPARK_RAPIDS_VERSION=$(get_metadata_attribute 'spark-rapids-version' ${DEFAULT_SPARK_RAPIDS_VERSION})
-readonly XGBOOST_VERSION=$(get_metadata_attribute 'xgboost-version' ${DEFAULT_XGBOOST_VERSION})
+readonly HARDCODED_RAPIDS_VERSION="26.06.0"
+
+# 1. Try to get explicit version from GCE Metadata
+SPARK_RAPIDS_VERSION=$(get_metadata_attribute 'spark-rapids-version' '')
+XGBOOST_VERSION=$(get_metadata_attribute 'xgboost-version' '')
+
+# 2. If not specified, try to auto-detect latest from Maven
+if [[ -z "${SPARK_RAPIDS_VERSION}" ]]; then
+  echo "INFO: spark-rapids-version not specified in metadata. Attempting to detect latest version..." >&2
+  LATEST_RAPIDS=$(get_latest_rapids_version "${SCALA_VERSION}")
+  if [[ -n "${LATEST_RAPIDS}" ]]; then
+    SPARK_RAPIDS_VERSION="${LATEST_RAPIDS}"
+    echo "INFO: Auto-detected latest RAPIDS version: ${SPARK_RAPIDS_VERSION}" >&2
+  fi
+fi
+
+if [[ -z "${XGBOOST_VERSION}" ]]; then
+  echo "INFO: xgboost-version not specified in metadata. Attempting to detect latest version..." >&2
+  LATEST_XGBOOST=$(get_latest_xgboost_version "${SCALA_VERSION}")
+  if [[ -n "${LATEST_XGBOOST}" ]]; then
+    XGBOOST_VERSION="${LATEST_XGBOOST}"
+    echo "INFO: Auto-detected latest XGBoost version: ${XGBOOST_VERSION}" >&2
+  fi
+fi
+
+# 3. If auto-detection failed (e.g. no internet), fall back to hardcoded default
+if [[ -z "${SPARK_RAPIDS_VERSION}" ]]; then
+  SPARK_RAPIDS_VERSION="${HARDCODED_RAPIDS_VERSION}"
+  echo "INFO: Auto-detection failed or skipped. Using hardcoded fallback for RAPIDS: ${SPARK_RAPIDS_VERSION}" >&2
+fi
+
+if [[ -z "${XGBOOST_VERSION}" ]]; then
+  XGBOOST_VERSION="${DEFAULT_XGBOOST_VERSION}"
+  echo "INFO: Auto-detection failed or skipped. Using hardcoded default for XGBoost: ${XGBOOST_VERSION}" >&2
+fi
+
+readonly SPARK_RAPIDS_VERSION
+readonly XGBOOST_VERSION
 
 # Fetch instance roles and runtime
 readonly ROLE=$(/usr/share/google/get_metadata_value attributes/dataproc-role)
@@ -294,6 +341,21 @@ readonly SPARK_CONF_DIR='/etc/spark/conf'
 NVIDIA_SMI_PATH='/usr/bin'
 MIG_MAJOR_CAPS=0
 IS_MIG_ENABLED=0
+
+function get_sysfs_gpu_count() {
+  local count=0
+  for dev in /sys/bus/pci/devices/*; do
+    if [[ -f "${dev}/vendor" ]] && [[ "$(cat "${dev}/vendor")" == "0x10de" ]]; then
+      if [[ -f "${dev}/class" ]]; then
+        local class_code=$(cat "${dev}/class")
+        if [[ "${class_code:0:4}" == "0x03" ]]; then
+          count=$((count + 1))
+        fi
+      fi
+    fi
+  done
+  echo $count
+}
 
 function execute_with_retries() {
   local -r cmd=$1
@@ -849,7 +911,7 @@ function setup_gpu_yarn() {
     fi
 
     # if mig is enabled drivers would have already been installed
-    if [[ $IS_MIG_ENABLED -eq 0 ]]; then
+    if [[ $IS_MIG_ENABLED -eq 0 ]] && ! command -v nvidia-smi &>/dev/null; then
       install_nvidia_gpu_driver
 
       #Install GPU metrics collection in Stackdriver if needed
@@ -900,7 +962,7 @@ function check_os_and_secure_boot() {
   if [[ "${SECURE_BOOT}" == "enabled" && $(echo "${DATAPROC_IMAGE_VERSION} <= 2.1" | bc -l) == 1 ]]; then
     echo "Error: Secure Boot is not supported before image 2.2. Please disable Secure Boot while creating the cluster."
     exit 1
-  elif [[ "${SECURE_BOOT}" == "enabled" ]] && [[ -z "${PSN}" ]]; then
+  elif [[ "${SECURE_BOOT}" == "enabled" ]] && [[ -z "${PSN}" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
       echo "Secure boot is enabled, but no signing material provided."
       echo "Please either disable secure boot or provide signing material as per"
       echo "https://github.com/GoogleCloudDataproc/custom-images/tree/master/examples/secure-boot"
@@ -930,26 +992,188 @@ function remove_old_backports {
 }
 
 
+function audit_environment() {
+  echo "=== Phase 1: Audit Environment ==="
+
+  AUDIT_GPU_HARDWARE="ABSENT"
+  if lspci 2>/dev/null | grep -q NVIDIA || [[ $(get_sysfs_gpu_count 2>/dev/null || echo 0) -gt 0 ]]; then
+    AUDIT_GPU_HARDWARE="PRESENT"
+  fi
+  export AUDIT_GPU_HARDWARE
+
+  AUDIT_NVIDIA_DRIVER="NOT_INSTALLED"
+  AUDIT_NVIDIA_DRIVER_VER="none"
+  if command -v nvidia-smi > /dev/null; then
+    AUDIT_NVIDIA_DRIVER="INSTALLED"
+    AUDIT_NVIDIA_DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || echo "unknown")
+  elif [[ -f /proc/driver/nvidia/version ]]; then
+     AUDIT_NVIDIA_DRIVER="INSTALLED"
+     AUDIT_NVIDIA_DRIVER_VER=$(awk '/Module Version/ {print $3}' /proc/driver/nvidia/version || echo "unknown")
+  fi
+  export AUDIT_NVIDIA_DRIVER AUDIT_NVIDIA_DRIVER_VER
+
+  AUDIT_CUDA_TOOLKIT="NOT_INSTALLED"
+  AUDIT_CUDA_VER="none"
+  if command -v nvcc > /dev/null; then
+    AUDIT_CUDA_TOOLKIT="INSTALLED"
+    AUDIT_CUDA_VER=$(nvcc --version | sed -n 's/.*release \([0-9.]\+\).*/\1/p' || echo "unknown")
+  elif [[ -d /usr/local/cuda ]]; then
+    AUDIT_CUDA_TOOLKIT="INSTALLED"
+    if [[ -f /usr/local/cuda/version.txt ]]; then
+       AUDIT_CUDA_VER=$(cat /usr/local/cuda/version.txt | awk '{print $3}' || echo "unknown")
+    fi
+  fi
+  export AUDIT_CUDA_TOOLKIT AUDIT_CUDA_VER
+
+  AUDIT_SPARK_RAPIDS_JAR="NOT_INSTALLED"
+  AUDIT_SPARK_RAPIDS_JAR_FILE=""
+  AUDIT_SPARK_RAPIDS_VER="none"
+  if compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" > /dev/null; then
+    AUDIT_SPARK_RAPIDS_JAR="INSTALLED"
+    AUDIT_SPARK_RAPIDS_JAR_FILE=$(compgen -G "/usr/lib/spark/jars/rapids-4-spark_*.jar" | head -n1)
+    basename=$(basename "${AUDIT_SPARK_RAPIDS_JAR_FILE}")
+    version_part=${basename#*_}
+    version_part=${version_part%.jar}
+    AUDIT_SPARK_RAPIDS_VER=${version_part#*-}
+    AUDIT_SPARK_RAPIDS_VER=${AUDIT_SPARK_RAPIDS_VER%-cuda12}
+  fi
+  export AUDIT_SPARK_RAPIDS_JAR AUDIT_SPARK_RAPIDS_JAR_FILE AUDIT_SPARK_RAPIDS_VER
+
+  AUDIT_XGBOOST_JAR="NOT_INSTALLED"
+  AUDIT_XGBOOST_JAR_FILE=""
+  AUDIT_XGBOOST_VER="none"
+  if compgen -G "/usr/lib/spark/jars/xgboost4j-spark-gpu_*.jar" > /dev/null; then
+    AUDIT_XGBOOST_JAR="INSTALLED"
+    AUDIT_XGBOOST_JAR_FILE=$(compgen -G "/usr/lib/spark/jars/xgboost4j-spark-gpu_*.jar" | head -n1)
+    basename=$(basename "${AUDIT_XGBOOST_JAR_FILE}")
+    version_part=${basename#*_}
+    version_part=${version_part%.jar}
+    AUDIT_XGBOOST_VER=${version_part#*-}
+  fi
+  export AUDIT_XGBOOST_JAR AUDIT_XGBOOST_JAR_FILE AUDIT_XGBOOST_VER
+
+  AUDIT_YARN_GPU_CONFIG="NOT_CONFIGURED"
+  if [[ -f "${HADOOP_CONF_DIR}/yarn-site.xml" ]] && grep -q "yarn.io/gpu" "${HADOOP_CONF_DIR}/yarn-site.xml" 2>/dev/null; then
+    AUDIT_YARN_GPU_CONFIG="CONFIGURED"
+  fi
+  export AUDIT_YARN_GPU_CONFIG
+
+  AUDIT_GPU_AGENT="NOT_INSTALLED"
+  if systemctl is-active --quiet google_gpu_monitoring_agent_venv.service 2>/dev/null; then
+    AUDIT_GPU_AGENT="ACTIVE"
+  fi
+  export AUDIT_GPU_AGENT
+
+  echo "- GPU Hardware: ${AUDIT_GPU_HARDWARE}"
+  echo "- NVIDIA Driver: ${AUDIT_NVIDIA_DRIVER} (${AUDIT_NVIDIA_DRIVER_VER})"
+  echo "- CUDA Toolkit: ${AUDIT_CUDA_TOOLKIT} (${AUDIT_CUDA_VER})"
+  echo "- Spark RAPIDS JAR: ${AUDIT_SPARK_RAPIDS_JAR} (Ver: ${AUDIT_SPARK_RAPIDS_VER}, File: ${AUDIT_SPARK_RAPIDS_JAR_FILE:-none})"
+  echo "- XGBoost GPU JAR: ${AUDIT_XGBOOST_JAR} (Ver: ${AUDIT_XGBOOST_VER})"
+  echo "- YARN GPU Config: ${AUDIT_YARN_GPU_CONFIG}"
+  echo "- GPU Monitoring Agent: ${AUDIT_GPU_AGENT}"
+  echo "-----------------------------------"
+}
+
+PLAN_ACTIONS=()
+
+function plan_installation() {
+  echo "=== Phase 2: Generate Plan ==="
+  PLAN_ACTIONS=()
+
+  # Driver and CUDA toolkit installation needed if GPU hardware present but driver or CUDA toolkit missing
+  if [[ "${AUDIT_GPU_HARDWARE}" == "PRESENT" ]] && { [[ "${AUDIT_NVIDIA_DRIVER}" != "INSTALLED" ]] || [[ "${AUDIT_CUDA_TOOLKIT}" != "INSTALLED" ]]; }; then
+    PLAN_ACTIONS+=("INSTALL_NVIDIA_DRIVER")
+  else
+    echo "- Skip NVIDIA Driver & CUDA Toolkit installation (Driver: ${AUDIT_NVIDIA_DRIVER}, CUDA: ${AUDIT_CUDA_TOOLKIT})"
+  fi
+
+  # Spark RAPIDS and XGBoost JARs needed if missing or wrong version
+  local need_rapids_update=0
+  local need_xgboost_update=0
+
+  if [[ "${AUDIT_SPARK_RAPIDS_JAR}" != "INSTALLED" ]] || [[ "${AUDIT_SPARK_RAPIDS_VER}" != "${SPARK_RAPIDS_VERSION}" ]]; then
+    need_rapids_update=1
+    echo "- RAPIDS JAR update needed: Installed=${AUDIT_SPARK_RAPIDS_VER}, Target=${SPARK_RAPIDS_VERSION}"
+  fi
+
+  if [[ "${AUDIT_XGBOOST_JAR}" != "INSTALLED" ]] || [[ "${AUDIT_XGBOOST_VER}" != "${XGBOOST_VERSION}" ]]; then
+    need_xgboost_update=1
+    echo "- XGBoost JAR update needed: Installed=${AUDIT_XGBOOST_VER}, Target=${XGBOOST_VERSION}"
+  fi
+
+  if [[ ${need_rapids_update} -eq 1 ]] || [[ ${need_xgboost_update} -eq 1 ]]; then
+    if [[ "${AUDIT_SPARK_RAPIDS_JAR}" == "INSTALLED" ]] || [[ "${AUDIT_XGBOOST_JAR}" == "INSTALLED" ]]; then
+      PLAN_ACTIONS+=("REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS")
+    else
+      PLAN_ACTIONS+=("INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS")
+    fi
+  else
+    echo "- Skip RAPIDS & XGBoost JAR installation (Up to date)"
+  fi
+
+  # YARN GPU configuration needed if missing
+  if [[ "${AUDIT_YARN_GPU_CONFIG}" != "CONFIGURED" ]]; then
+    PLAN_ACTIONS+=("CONFIGURE_YARN_GPU")
+  fi
+
+
+
+  echo "- Planned Actions:"
+  for action in "${PLAN_ACTIONS[@]}"; do
+    echo "  * ${action}"
+  done
+  echo "-----------------------------------"
+}
+
+function execute_plan() {
+  echo "=== Phase 3: Execute Plan ==="
+
+  if is_debian || is_ubuntu ; then
+    execute_with_retries "apt-get --allow-releaseinfo-change update"
+  fi
+
+  for action in "${PLAN_ACTIONS[@]}"; do
+    case "${action}" in
+      INSTALL_NVIDIA_DRIVER)
+        echo "Executing: INSTALL_NVIDIA_DRIVER"
+        install_nvidia_gpu_driver
+        ;;
+      INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS)
+        echo "Executing: INSTALL_SPARK_RAPIDS_AND_XGBOOST_JARS"
+        install_spark_rapids
+        ;;
+      REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS)
+        echo "Executing: REPLACE_SPARK_RAPIDS_AND_XGBOOST_JARS"
+        rm -f /usr/lib/spark/jars/rapids-4-spark_*.jar
+        rm -f /usr/lib/spark/jars/xgboost4j-*.jar
+        install_spark_rapids
+        ;;
+      CONFIGURE_YARN_GPU)
+        echo "Executing: CONFIGURE_YARN_GPU"
+        setup_gpu_yarn
+        configure_spark
+        ;;
+    esac
+  done
+}
+
 function main() {
+  audit_environment
+  plan_installation
   if is_debian && [[ $(echo "${DATAPROC_IMAGE_VERSION} <= 2.1" | bc -l) == 1 ]]; then
     remove_old_backports
   fi
   check_os_and_secure_boot
-  setup_gpu_yarn
-  if [[ "${RUNTIME}" == "SPARK" ]]; then
-    install_spark_rapids
-    configure_spark
-    echo "RAPIDS initialized with Spark runtime"
-  else
-    echo "Unsupported RAPIDS Runtime: ${RUNTIME}"
-    exit 1
-  fi
 
+  execute_plan
+
+  # Always ensure services are restarted/running if we did configure YARN
   for svc in resourcemanager nodemanager; do
     if [[ $(systemctl show hadoop-yarn-${svc}.service -p SubState --value) == 'running' ]]; then
       systemctl restart hadoop-yarn-${svc}.service
     fi
   done
+
   if is_debian || is_ubuntu ; then
     apt-get clean
   fi
