@@ -288,6 +288,13 @@ NVIDIA_DRIVER_VERSION=$(get_metadata_attribute 'driver-version' '550.54.15') #53
 CUDA_VERSION_MAJOR="${CUDA_VERSION%.*}"  #12.2
 
 # EXCEPTIONS
+# Debian 12 security kernel 6.1.0-52 includes a four-argument
+# pci_resize_resource API that is incompatible with NVIDIA 550 open modules.
+if is_debian12 ; then
+  NVIDIA_DRIVER_VERSION=$(get_metadata_attribute 'driver-version' '580.95.05')
+  USE_REPO_INSTALL="true"
+fi
+
 # Change CUDA version for Ubuntu 18 (Cuda 12.1.1 - Driver v530.30.02 is the latest version supported by Ubuntu 18)
 # Change CUDA version for Ubuntu 24 (Cuda 12.4.1 is not available, use 12.6.0)
 if [[ "${OS_NAME}" == "ubuntu" ]]; then
@@ -518,30 +525,49 @@ function install_nvidia_gpu_driver() {
 
     execute_with_retries "apt-get install -y -q 'linux-headers-$(uname -r)'"
 
-    curl -fsSL --retry-connrefused --retry 3 --retry-max-time 5 \
-      "${LOCAL_DEB_URL}" -o /tmp/local-installer.deb
+    if [[ "${USE_REPO_INSTALL:-false}" == "true" ]]; then
+      execute_with_retries \
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/${shortname}/x86_64/cuda-keyring_1.1-1_all.deb"
+      execute_with_retries "dpkg -i cuda-keyring_1.1-1_all.deb"
+      rm -f cuda-keyring_1.1-1_all.deb
+      execute_with_retries "apt-get update"
 
-    dpkg -i /tmp/local-installer.deb
-    rm /tmp/local-installer.deb
-    cp ${DIST_KEYRING_DIR}/cuda-*-keyring.gpg /usr/share/keyrings/
+      execute_with_retries "apt-get install -y -q --no-install-recommends dkms"
+      execute_with_retries \
+        "apt-get install -y -q --no-install-recommends nvidia-driver-pinning-${NVIDIA_DRIVER_VERSION_PREFIX}"
+      execute_with_retries "apt-get update"
+      configure_dkms_certs
+      execute_with_retries \
+        "apt-get install -y -q --no-install-recommends nvidia-kernel-open-dkms nvidia-driver-cuda"
+      clear_dkms_key
+      execute_with_retries \
+        "apt-get install -y -q --no-install-recommends cuda-toolkit-${CUDA_VERSION_MAJOR//./-}"
+    else
+      curl -fsSL --retry-connrefused --retry 3 --retry-max-time 5 \
+        "${LOCAL_DEB_URL}" -o /tmp/local-installer.deb
 
-    add_contrib_components
+      dpkg -i /tmp/local-installer.deb
+      rm /tmp/local-installer.deb
+      cp ${DIST_KEYRING_DIR}/cuda-*-keyring.gpg /usr/share/keyrings/
 
-    execute_with_retries "apt-get update"
+      add_contrib_components
 
-    ## EXCEPTION
-    if is_debian10 ; then
-      apt-get remove -y libglvnd0
-      apt-get install -y ca-certificates-java
+      execute_with_retries "apt-get update"
+
+      ## EXCEPTION
+      if is_debian10 ; then
+        apt-get remove -y libglvnd0
+        apt-get install -y ca-certificates-java
+      fi
+
+      configure_dkms_certs
+      execute_with_retries "apt-get install -y -q nvidia-kernel-open-dkms"
+      clear_dkms_key
+      execute_with_retries \
+        "apt-get install -y -q --no-install-recommends cuda-drivers-${NVIDIA_DRIVER_VERSION_PREFIX}"
+      execute_with_retries \
+        "apt-get install -y -q --no-install-recommends cuda-toolkit-${CUDA_VERSION_MAJOR//./-}"
     fi
-
-    configure_dkms_certs
-    execute_with_retries "apt-get install -y -q nvidia-kernel-open-dkms"
-    clear_dkms_key
-    execute_with_retries \
-	"apt-get install -y -q --no-install-recommends cuda-drivers-${NVIDIA_DRIVER_VERSION_PREFIX}"
-    execute_with_retries \
-	"apt-get install -y -q --no-install-recommends cuda-toolkit-${CUDA_VERSION_MAJOR//./-}"
 
     modprobe nvidia
 
