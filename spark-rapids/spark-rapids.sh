@@ -238,7 +238,7 @@ else
 fi
 
 # Update SPARK RAPIDS config
-readonly HARDCODED_RAPIDS_VERSION="26.06.0"
+readonly HARDCODED_RAPIDS_VERSION="26.08.0"
 
 # 1. Try to get explicit version from GCE Metadata
 SPARK_RAPIDS_VERSION=$(get_metadata_attribute 'spark-rapids-version' '')
