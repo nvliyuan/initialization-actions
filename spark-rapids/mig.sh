@@ -26,6 +26,8 @@
 
 set -euxo pipefail
 
+readonly ROLE="$(/usr/share/google/get_metadata_value attributes/dataproc-role)"
+
 function os_id() {
   grep '^ID=' /etc/os-release | cut -d= -f2 | xargs
 }
@@ -535,6 +537,13 @@ function remove_old_backports {
 }
 
 function main() {
+  # Rebooting a master before Dataproc initialization completes causes its
+  # master-only services to be initialized twice. MIG is only needed on workers.
+  if [[ "${ROLE}" == "Master" ]]; then
+    echo "Skipping MIG setup and reboot on Dataproc master"
+    return
+  fi
+
   if [[ ${OS_NAME} == debian ]] && [[ $(echo "${DATAPROC_IMAGE_VERSION} <= 2.1" | bc -l) == 1 ]]; then
     remove_old_backports
   fi
